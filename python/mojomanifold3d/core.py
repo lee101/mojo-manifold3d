@@ -178,16 +178,80 @@ def _edge_status(vertices: np.ndarray, faces: np.ndarray) -> Error:
     second = np.concatenate((faces[:, 1], faces[:, 2], faces[:, 0]))
     low = np.minimum(first, second)
     high = np.maximum(first, second)
-    edge_keys = low * np.int64(len(vertices)) + high
-    unique, inverse, counts = np.unique(
-        edge_keys, return_inverse=True, return_counts=True
+    # One int64 per directed edge, `2 * undirected_key + orientation`, so a
+    # single sort groups the two occurrences of every undirected edge and
+    # carries their orientation in the low bit. A closed oriented manifold has
+    # exactly two occurrences of every edge, differing only in that bit.
+    undirected = low * np.int64(len(vertices)) + high
+    oriented = undirected * 2 + (first < second)
+    oriented.sort()
+    groups = oriented >> 1
+    starts = np.flatnonzero(
+        np.concatenate(([True], groups[1:] != groups[:-1]))
     )
-    if len(unique) == 0 or np.any(counts != 2):
+    ends = np.concatenate((starts[1:], [len(oriented)]))
+    if len(starts) == 0 or np.any(ends - starts != 2):
         return Error.NotManifold
-    signs = np.where(first < second, 1, -1)
-    if np.any(np.bincount(inverse, weights=signs, minlength=len(unique)) != 0):
+    if not np.all(oriented[starts + 1] == oriented[starts] + 1):
         return Error.NotManifold
     return Error.NoError
+
+
+def _weld_crossings(
+    triangles: np.ndarray,
+    edge_keys: np.ndarray,
+    node_count: int,
+    nx: int,
+    ny: int,
+):
+    """Give every distinct marching-tetrahedra cell edge one shared vertex.
+
+    `edge_keys` encodes an edge as `low * node_count + high`, where both nodes
+    are corners of the same cell. The 13 pairs a six-tetrahedron cell can use
+    are all within one cell, so `low` and the gap between the nodes determine
+    the edge: mapping the gap through a small table turns the key into a dense
+    slot and lets a scatter replace a sort of three times the triangle count.
+    """
+    flat = triangles.reshape((-1, 3))
+    stride_y = nx
+    stride_z = nx * ny
+    gaps = np.array(
+        [
+            1,
+            stride_y - 1,
+            stride_y,
+            stride_y + 1,
+            stride_z - stride_y - 1,
+            stride_z - stride_y,
+            stride_z - stride_y + 1,
+            stride_z - 1,
+            stride_z,
+            stride_z + 1,
+            stride_y + stride_z - 1,
+            stride_y + stride_z,
+            stride_y + stride_z + 1,
+        ],
+        dtype=np.int64,
+    )
+    if nx < 2 or ny < 2 or gaps.min() < 1 or len(set(gaps.tolist())) != 13:
+        _, first_indices, inverse = np.unique(
+            edge_keys, return_index=True, return_inverse=True
+        )
+        return flat[first_indices], inverse.reshape((-1, 3))
+    keys = edge_keys.reshape(-1)
+    low = keys // node_count
+    lookup = np.full(stride_y + stride_z + 2, 13, dtype=np.int64)
+    lookup[gaps] = np.arange(13, dtype=np.int64)
+    dense = low * 14 + lookup[keys - low * node_count - low]
+    size = 14 * node_count
+    last = np.full(size, -1, dtype=np.int32)
+    last[dense] = np.arange(len(dense), dtype=np.int32)
+    present_slots = np.flatnonzero(last >= 0)
+    vertex_of_slot = np.full(size, -1, dtype=np.int32)
+    vertex_of_slot[present_slots] = np.arange(
+        len(present_slots), dtype=np.int32
+    )
+    return flat[last[present_slots]], vertex_of_slot[dense].reshape((-1, 3))
 
 
 def _compact(vertices: np.ndarray, faces: np.ndarray):
@@ -246,6 +310,7 @@ class Manifold:
         self._vertices = np.empty((0, 3), dtype=np.float64)
         self._faces = np.empty((0, 3), dtype=np.int64)
         self._convex_hint: bool | None = True
+        self._measure_cache: np.ndarray | None = None
         if mesh is None:
             return
         if not isinstance(mesh, Mesh):
@@ -391,16 +456,26 @@ class Manifold:
             (4, 0, 2), (4, 2, 1), (4, 1, 3), (4, 3, 0),
             (5, 2, 0), (5, 1, 2), (5, 3, 1), (5, 0, 3),
         ]
-        points = []
-        for a, b, c in octants:
-            for i in range(frequency + 1):
-                for j in range(frequency + 1 - i):
-                    k = frequency - i - j
-                    point = (i * base[a] + j * base[b] + k * base[c]) / frequency
-                    points.append(point / np.linalg.norm(point) * radius)
-        rounded = np.round(np.asarray(points), 14)
-        points = np.unique(rounded, axis=0)
-        return _convex_hull(points)
+        steps = np.arange(frequency + 1)
+        first, second = np.meshgrid(steps, steps, indexing="ij")
+        keep = (first + second) <= frequency
+        first = first[keep]
+        second = second[keep]
+        third = frequency - first - second
+        points = np.concatenate(
+            [
+                (
+                    first[:, None] * base[a]
+                    + second[:, None] * base[b]
+                    + third[:, None] * base[c]
+                )
+                / frequency
+                for a, b, c in octants
+            ]
+        )
+        points = points / np.linalg.norm(points, axis=1, keepdims=True) * radius
+        rounded = np.round(points, 14)
+        return _convex_hull(np.unique(rounded, axis=0))
 
     @staticmethod
     def hull_points(pts):
@@ -476,6 +551,11 @@ class Manifold:
         return tuple(np.concatenate((low, high)).tolist())
 
     def _measure(self):
+        # The vertex and face buffers never change after construction, so
+        # volume() and surface_area() on the same solid share one pass.
+        cached = self._measure_cache
+        if cached is not None:
+            return cached
         if self.is_empty():
             return np.zeros(2)
         result = np.zeros(2, dtype=np.float64)
@@ -483,6 +563,7 @@ class Manifold:
             addr(self._vertices), addr(self._faces), len(self._faces),
             addr(result, writable=True)
         )
+        self._measure_cache = result
         return result
 
     def volume(self) -> float:
@@ -823,12 +904,9 @@ def _boolean(
     )
     if emitted != triangle_count:
         raise RuntimeError("marching-tetrahedra count and emit passes disagreed")
-    flat = triangles.reshape((-1, 3))
-    _, first_indices, inverse = np.unique(
-        edge_keys, return_index=True, return_inverse=True
+    vertices, faces = _weld_crossings(
+        triangles, edge_keys, nx * ny * nz, nx, ny
     )
-    vertices = flat[first_indices]
-    faces = inverse.reshape((-1, 3))
     keep = (
         (faces[:, 0] != faces[:, 1])
         & (faces[:, 1] != faces[:, 2])

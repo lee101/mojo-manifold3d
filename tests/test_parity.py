@@ -383,3 +383,207 @@ def test_boolean_rejects_unknown_device():
     first, second = overlapping_boxes(mm)
     with pytest.raises(ValueError):
         first.boolean(second, mm.OpType.Add, device="tpu")
+
+
+RAY_DIRECTION = (1.0, 0.3713906763541037, 0.6947465906068658)
+
+
+def reference_signed_distance(solid, origin, spacing, shape):
+    """Plain-Python point-triangle distance and ray parity, for kernel tests."""
+    vertices = solid._vertices
+    faces = solid._faces
+    nx, ny, nz = shape
+    values = np.empty(nx * ny * nz)
+    for z in range(nz):
+        for y in range(ny):
+            for x in range(nx):
+                point = origin + spacing * np.array([x, y, z], dtype=np.float64)
+                best2 = np.inf
+                hits = 0
+                for face in faces:
+                    a, b, c = vertices[face]
+                    ab = b - a
+                    ac = c - a
+                    ap = point - a
+                    d1 = ab @ ap
+                    d2 = ac @ ap
+                    d3 = ab @ (point - b)
+                    d4 = ac @ (point - b)
+                    d5 = ab @ (point - c)
+                    d6 = ac @ (point - c)
+                    vc = d1 * d4 - d3 * d2
+                    vb = d5 * d2 - d1 * d6
+                    va = d3 * d6 - d5 * d4
+                    if d1 <= 0.0 and d2 <= 0.0:
+                        best2 = min(best2, ap @ ap)
+                    elif d3 >= 0.0 and d4 <= d3:
+                        best2 = min(best2, (point - b) @ (point - b))
+                    elif vc <= 0.0 and d1 >= 0.0 and d3 <= 0.0:
+                        v = d1 / (d1 - d3)
+                        delta = ap - v * ab
+                        best2 = min(best2, delta @ delta)
+                    elif d6 >= 0.0 and d5 <= d6:
+                        best2 = min(best2, (point - c) @ (point - c))
+                    elif vb <= 0.0 and d2 >= 0.0 and d6 <= 0.0:
+                        w = d2 / (d2 - d6)
+                        delta = ap - w * ac
+                        best2 = min(best2, delta @ delta)
+                    elif va <= 0.0 and d4 - d3 >= 0.0 and d5 - d6 >= 0.0:
+                        w = (d4 - d3) / ((d4 - d3) + (d5 - d6))
+                        delta = (point - b) - w * (c - b)
+                        best2 = min(best2, delta @ delta)
+                    else:
+                        denom = 1.0 / (va + vb + vc)
+                        delta = ap - ab * (vb * denom) - ac * (vc * denom)
+                        best2 = min(best2, delta @ delta)
+                    direction = np.array(RAY_DIRECTION)
+                    h = np.cross(direction, ac)
+                    det = ab @ h
+                    if abs(det) > 1.0e-14:
+                        inv = 1.0 / det
+                        u = (ap @ h) * inv
+                        q = np.cross(ap, ab)
+                        v = (direction @ q) * inv
+                        t = (ac @ q) * inv
+                        if 0.0 <= u <= 1.0 and v >= 0.0 and u + v <= 1.0:
+                            if t > 1.0e-12:
+                                hits += 1
+                distance = max(np.sqrt(max(best2, 0.0)), spacing * 1.0e-9)
+                values[z * nx * ny + y * nx + x] = (
+                    distance if hits % 2 else -distance
+                )
+    return values
+
+
+@pytest.mark.parametrize("shape", [(2, 2, 2), (5, 3, 2), (7, 2, 2), (8, 1, 2)])
+def test_signed_distance_matches_reference_for_both_widths(shape):
+    # nx below the vector width takes the scalar fallback, and nx above it
+    # leaves a short row that the overlapping final chunk has to cover.
+    solid = mm.Manifold.cube()
+    spacing = 0.37
+    origin = np.array([-0.6, -0.4, -0.2])
+    expected = reference_signed_distance(solid, origin, spacing, shape)
+    result = np.empty(int(np.prod(shape)))
+    lib().mm_signed_distance(
+        addr(solid._vertices),
+        addr(solid._faces),
+        len(solid._faces),
+        float(origin[0]),
+        float(origin[1]),
+        float(origin[2]),
+        spacing,
+        shape[0],
+        shape[1],
+        shape[2],
+        addr(result, writable=True),
+    )
+    assert result == pytest.approx(expected, abs=1e-12)
+
+
+def test_weld_crossings_dense_path_matches_sorted_path():
+    rng = np.random.default_rng(11)
+    nx = ny = nz = 6
+    node_count = nx * ny * nz
+    cells = rng.integers(0, nx - 1, size=(60, 3))
+    # The 13 cell-internal edges a six-tetrahedron cell can cross.
+    corner_pairs = [
+        (0, 1), (0, 2), (0, 3), (0, 4), (0, 5), (0, 6), (0, 7),
+        (1, 3), (1, 5), (2, 3), (2, 6), (4, 5), (4, 6),
+    ]
+    corners = [
+        rng.integers(0, len(corner_pairs), size=len(cells)) for _ in range(3)
+    ]
+    keys = np.empty((len(cells), 3), dtype=np.int64)
+    for slot, chosen in enumerate(corners):
+        first = np.array([corner_pairs[c][0] for c in chosen])
+        second = np.array([corner_pairs[c][1] for c in chosen])
+        base = (cells[:, 2] * ny + cells[:, 1]) * nx + cells[:, 0]
+        start = base + (first & 1) + ((first >> 1) & 1) * nx + (first >> 2) * nx * ny
+        stop = base + (second & 1) + ((second >> 1) & 1) * nx + (second >> 2) * nx * ny
+        keys[:, slot] = np.minimum(start, stop) * node_count + np.maximum(
+            start, stop
+        )
+    # A crossing point only depends on its edge, so every occurrence of an edge
+    # carries the same coordinates, as the marching-tetrahedra kernel emits.
+    triangles = np.repeat(keys.astype(np.float64)[:, :, None], 3, axis=2)
+    dense_vertices, dense_faces = core._weld_crossings(
+        triangles, keys, node_count, nx, ny
+    )
+    sorted_vertices, sorted_faces = core._weld_crossings(
+        triangles, keys, node_count, 1, ny
+    )
+    assert len(dense_vertices) == len(sorted_vertices)
+    assert np.array_equal(
+        np.sort(dense_vertices, axis=0), np.sort(sorted_vertices, axis=0)
+    )
+    assert dense_faces.shape == sorted_faces.shape
+    assert len(np.unique(dense_faces)) == len(np.unique(sorted_faces))
+
+
+def test_weld_crossings_merges_every_repeated_edge():
+    # Two triangles whose corners sit on the cell edges {3,4} and {0,3}, and on
+    # {0,7} and {0,5}, each edge repeated by both incident triangles.
+    triangles = np.arange(2 * 3 * 3, dtype=np.float64).reshape((2, 3, 3))
+    node_count = 8
+    keys = np.array(
+        [[3 * node_count + 4, 3, 3 * node_count + 4], [7, 5, 7]],
+        dtype=np.int64,
+    )
+    vertices, faces = core._weld_crossings(
+        triangles, keys, node_count, 2, 2
+    )
+    assert len(vertices) == 4
+    assert faces[0, 0] == faces[0, 2]
+    assert faces[1, 0] == faces[1, 2]
+    assert len(np.unique(faces)) == 4
+    fallback_vertices, fallback_faces = core._weld_crossings(
+        triangles, keys, node_count, 1, 2
+    )
+    assert len(fallback_vertices) == len(vertices)
+    assert len(np.unique(fallback_faces)) == 4
+
+
+def test_edge_status_accepts_two_closed_meshes_and_rejects_a_flap():
+    cube = mm.Manifold.cube()
+    vertices, faces = cube._vertices, cube._faces
+    assert core._edge_status(vertices, faces) is mm.Error.NoError
+    doubled = np.concatenate((faces, faces + len(vertices)))
+    doubled_vertices = np.concatenate((vertices, vertices + 0.5))
+    assert core._edge_status(doubled_vertices, doubled) is mm.Error.NoError
+    flipped = faces.copy()
+    flipped[0] = flipped[0][[0, 2, 1]]
+    assert core._edge_status(vertices, flipped) is mm.Error.NotManifold
+    opened = np.delete(faces, 0, axis=0)
+    assert core._edge_status(vertices, opened) is mm.Error.NotManifold
+    assert core._edge_status(vertices, faces[:0]) is mm.Error.NoError
+
+
+def test_march_count_and_emit_agree_on_saturated_and_straddling_fields():
+    nx = ny = nz = 7
+    field = np.ones(nx * ny * nz)
+    assert lib().mm_march_count(addr(field), nx, ny, nz) == 0
+    field = -np.ones(nx * ny * nz)
+    assert lib().mm_march_count(addr(field), nx, ny, nz) == 0
+    rng = np.random.default_rng(5)
+    field = rng.normal(size=nx * ny * nz)
+    count = int(lib().mm_march_count(addr(field), nx, ny, nz))
+    assert count > 0
+    triangles = np.empty((count, 3, 3))
+    keys = np.empty((count, 3), dtype=np.int64)
+    emitted = lib().mm_march_emit(
+        addr(field),
+        addr(triangles, writable=True),
+        addr(keys, writable=True),
+        nx,
+        ny,
+        nz,
+        -1.0,
+        0.5,
+        0.25,
+        0.5,
+    )
+    assert emitted == count
+    assert np.isfinite(triangles).all()
+    assert (keys >= 0).all()
+    assert (keys < nx * ny * nz * nx * ny * nz).all()
+    assert 0 < np.unique(keys).size <= 3 * count
