@@ -1,20 +1,19 @@
 """Geometry kernels exported through a stable C ABI.
 
 Python owns every buffer. Addresses cross the ABI as Int so exported
-functions are non-parametric under the Mojo 1.0 nightly compiler.
+functions stay non-parametric. The CPU kernels are single-threaded: this
+toolchain has no `parallelize`, so grid work runs in one serial loop.
 """
 
-from std.algorithm import parallelize
-from std.gpu import block_dim, block_idx, thread_idx
-from std.gpu.host import DeviceContext
+from max.gpu import block_dim, block_idx, thread_idx
+from max.gpu.host import DeviceContext
 from std.math import sqrt
-from std.sys import has_accelerator
-from std.sys.info import num_physical_cores, simd_width_of as simdwidthof
+from std.sys import has_accelerator, simd_width_of
 
-comptime FPtr = UnsafePointer[Float64, AnyOrigin[mut=True]]
-comptime IPtr = UnsafePointer[Int64, AnyOrigin[mut=True]]
-comptime GPUFPtr = UnsafePointer[Float64, MutAnyOrigin]
-comptime GPUIPtr = UnsafePointer[Int64, MutAnyOrigin]
+comptime FPtr = Pointer[Float64, AnyOrigin[mut=True]]
+comptime IPtr = Pointer[Int64, AnyOrigin[mut=True]]
+comptime GPUFPtr = Pointer[Float64, AnyOrigin[mut=True]]
+comptime GPUIPtr = Pointer[Int64, AnyOrigin[mut=True]]
 
 
 def fp(address: Int) -> FPtr:
@@ -180,18 +179,18 @@ def signed_distance_chunk(
         var best2 = 1.7976931348623157e308
         var hits = 0
         for triangle in range(triangle_count):
-            var ia = Int(faces[triangle * 3]) * 3
-            var ib = Int(faces[triangle * 3 + 1]) * 3
-            var ic = Int(faces[triangle * 3 + 2]) * 3
-            var ax = vertices[ia]
-            var ay = vertices[ia + 1]
-            var az = vertices[ia + 2]
-            var bx = vertices[ib]
-            var by = vertices[ib + 1]
-            var bz = vertices[ib + 2]
-            var cx = vertices[ic]
-            var cy = vertices[ic + 1]
-            var cz = vertices[ic + 2]
+            var ia = Int(faces.unsafe_load(triangle * 3)) * 3
+            var ib = Int(faces.unsafe_load(triangle * 3 + 1)) * 3
+            var ic = Int(faces.unsafe_load(triangle * 3 + 2)) * 3
+            var ax = vertices.unsafe_load(ia)
+            var ay = vertices.unsafe_load(ia + 1)
+            var az = vertices.unsafe_load(ia + 2)
+            var bx = vertices.unsafe_load(ib)
+            var by = vertices.unsafe_load(ib + 1)
+            var bz = vertices.unsafe_load(ib + 2)
+            var cx = vertices.unsafe_load(ic)
+            var cy = vertices.unsafe_load(ic + 1)
+            var cz = vertices.unsafe_load(ic + 2)
             best2 = min(
                 best2,
                 point_triangle_distance2(
@@ -203,7 +202,9 @@ def signed_distance_chunk(
             ):
                 hits += 1
         var distance = max(sqrt(max(best2, 0.0)), spacing * 1.0e-9)
-        result[point] = distance if hits % 2 == 1 else -distance
+        result.unsafe_store(
+            point, (distance if hits % 2 == 1 else -distance)
+        )
 
 
 @export("mm_signed_distance")
@@ -220,80 +221,60 @@ def mm_signed_distance(
     nz: Int,
     result_address: Int,
 ) abi("C"):
-    var vertices = fp(vertices_address)
-    var faces = ip(faces_address)
-    var result = fp(result_address)
-    var count = nx * ny * nz
-    var tasks = min(num_physical_cores(), 16)
-    if count < 8_192:
-        tasks = 1
-
-    @parameter
-    @__copy_capture(
-        vertices, faces, triangle_count, ox, oy, oz, spacing, nx, ny,
-        count, result, tasks
+    signed_distance_chunk(
+        fp(vertices_address),
+        ip(faces_address),
+        triangle_count,
+        ox,
+        oy,
+        oz,
+        spacing,
+        nx,
+        ny,
+        0,
+        nx * ny * nz,
+        fp(result_address),
     )
-    @always_inline
-    def process(task: Int):
-        signed_distance_chunk(
-            vertices,
-            faces,
-            triangle_count,
-            ox,
-            oy,
-            oz,
-            spacing,
-            nx,
-            ny,
-            count * task // tasks,
-            count * (task + 1) // tasks,
-            result,
-        )
-
-    if tasks == 1:
-        process(0)
-    else:
-        parallelize[process](tasks, tasks)
 
 
 def signed_distance_gpu_kernel(
     vertices: GPUFPtr,
     faces: GPUIPtr,
-    triangle_count: Int,
+    triangle_count: Int32,
     ox: Float64,
     oy: Float64,
     oz: Float64,
     spacing: Float64,
-    nx: Int,
-    ny: Int,
-    count: Int,
+    nx: Int32,
+    ny: Int32,
+    count: Int32,
     result: GPUFPtr,
 ):
     var point = block_idx.x * block_dim.x + thread_idx.x
-    if point >= count:
+    if point >= Int(count):
         return
-    var x_index = point % nx
-    var yz = point // nx
-    var y_index = yz % ny
-    var z_index = yz // ny
+    var x_index = point % Int(nx)
+    var yz = point // Int(nx)
+    var y_index = yz % Int(ny)
+    var z_index = yz // Int(ny)
     var px = ox + spacing * Float64(x_index)
     var py = oy + spacing * Float64(y_index)
     var pz = oz + spacing * Float64(z_index)
     var best2 = 1.7976931348623157e308
     var hits = 0
-    for triangle in range(triangle_count):
-        var ia = Int(faces[triangle * 3]) * 3
-        var ib = Int(faces[triangle * 3 + 1]) * 3
-        var ic = Int(faces[triangle * 3 + 2]) * 3
-        var ax = vertices[ia]
-        var ay = vertices[ia + 1]
-        var az = vertices[ia + 2]
-        var bx = vertices[ib]
-        var by = vertices[ib + 1]
-        var bz = vertices[ib + 2]
-        var cx = vertices[ic]
-        var cy = vertices[ic + 1]
-        var cz = vertices[ic + 2]
+    for triangle in range(Int(triangle_count)):
+        var ia = Int(faces.unsafe_load(Int(triangle) * 3)) * 3
+        var ib = Int(faces.unsafe_load(Int(triangle) * 3 + 1)) * 3
+        var ic = Int(faces.unsafe_load(Int(triangle) * 3 + 2)) * 3
+        var ax = vertices.unsafe_load(ia)
+        var ay = vertices.unsafe_load(ia + 1)
+        var az = vertices.unsafe_load(ia + 2)
+        var bx = vertices.unsafe_load(ib)
+        var by = vertices.unsafe_load(ib + 1)
+        var bz = vertices.unsafe_load(ib + 2)
+        var cx = vertices.unsafe_load(ic)
+        var cy = vertices.unsafe_load(ic + 1)
+        var cz = vertices.unsafe_load(ic + 2)
         best2 = min(
             best2,
             point_triangle_distance2(
@@ -305,7 +286,9 @@ def signed_distance_gpu_kernel(
         ):
             hits += 1
     var distance = max(sqrt(max(best2, 0.0)), spacing * 1.0e-9)
-    result[point] = distance if hits % 2 == 1 else -distance
+    result.unsafe_store(
+        Int(point), (distance if hits % 2 == 1 else -distance)
+    )
 
 
 @export("mm_signed_distance_gpu")
@@ -348,14 +331,14 @@ def mm_signed_distance_gpu(
                 ctx.enqueue_function[signed_distance_gpu_kernel](
                     vertices_device,
                     faces_device,
-                    triangle_count,
+                    Int32(triangle_count),
                     ox,
                     oy,
                     oz,
                     spacing,
-                    nx,
-                    ny,
-                    count,
+                    Int32(nx),
+                    Int32(ny),
+                    Int32(count),
                     result_device,
                     grid_dim=(count + 255) // 256,
                     block_dim=256,
@@ -429,14 +412,14 @@ def mm_signed_distance_pair_gpu(
                     kernel,
                     first_vertices,
                     first_faces,
-                    first_triangle_count,
+                    Int32(first_triangle_count),
                     ox,
                     oy,
                     oz,
                     spacing,
-                    nx,
-                    ny,
-                    count,
+                    Int32(nx),
+                    Int32(ny),
+                    Int32(count),
                     first_result,
                     grid_dim=(count + 255) // 256,
                     block_dim=256,
@@ -445,14 +428,14 @@ def mm_signed_distance_pair_gpu(
                     kernel,
                     second_vertices,
                     second_faces,
-                    second_triangle_count,
+                    Int32(second_triangle_count),
                     ox,
                     oy,
                     oz,
                     spacing,
-                    nx,
-                    ny,
-                    count,
+                    Int32(nx),
+                    Int32(ny),
+                    Int32(count),
                     second_result,
                     grid_dim=(count + 255) // 256,
                     block_dim=256,
@@ -476,38 +459,30 @@ def mm_combine_fields(
     var first = fp(first_address)
     var second = fp(second_address)
     var result = fp(result_address)
-    comptime W = simdwidthof[DType.float64]()
-
-    @parameter
-    @__copy_capture(first, second, result, count, operation)
-    @always_inline
-    def process(task: Int):
-        var tasks = min(num_physical_cores(), 16) if count >= 262_144 else 1
-        var begin = count * task // tasks
-        var end = count * (task + 1) // tasks
-        var vector_end = begin + (end - begin) // W * W
-        for i in range(begin, vector_end, W):
-            var a = first.load[width=W](i)
-            var b = second.load[width=W](i)
-            if operation == 0:
-                result.store(i, max(a, b))
-            elif operation == 1:
-                result.store(i, min(a, -b))
-            else:
-                result.store(i, min(a, b))
-        for i in range(vector_end, end):
-            if operation == 0:
-                result[i] = max(first[i], second[i])
-            elif operation == 1:
-                result[i] = min(first[i], -second[i])
-            else:
-                result[i] = min(first[i], second[i])
-
-    var tasks = min(num_physical_cores(), 16) if count >= 262_144 else 1
-    if tasks == 1:
-        process(0)
-    else:
-        parallelize[process](tasks, tasks)
+    comptime W = simd_width_of[DType.float64]()
+    var vector_end = count // W * W
+    for i in range(0, vector_end, W):
+        var a = first.unsafe_load[width=W](i)
+        var b = second.unsafe_load[width=W](i)
+        if operation == 0:
+            result.unsafe_store(i, max(a, b))
+        elif operation == 1:
+            result.unsafe_store(i, min(a, -b))
+        else:
+            result.unsafe_store(i, min(a, b))
+    for i in range(vector_end, count):
+        if operation == 0:
+            result.unsafe_store(
+                i, max(first.unsafe_load(i), second.unsafe_load(i))
+            )
+        elif operation == 1:
+            result.unsafe_store(
+                i, min(first.unsafe_load(i), -second.unsafe_load(i))
+            )
+        else:
+            result.unsafe_store(
+                i, min(first.unsafe_load(i), second.unsafe_load(i))
+            )
 
 
 @always_inline
@@ -585,7 +560,7 @@ def tetrahedron_triangle_count(
         var index = grid_index(
             x + node_x(node), y + node_y(node), z + node_z(node), nx, ny
         )
-        if field[index] > 0.0:
+        if field.unsafe_load(index) > 0.0:
             inside += 1
     if inside == 0 or inside == 4:
         return 0
@@ -610,13 +585,13 @@ def mm_march_count(
 
 @always_inline
 def crossing(
-    values: InlineArray[Float64, 4],
-    coordinates: InlineArray[Float64, 12],
-    node_ids: InlineArray[Int, 4],
+    values: Array[Float64, 4],
+    coordinates: Array[Float64, 12],
+    node_ids: Array[Int, 4],
     first: Int,
     second: Int,
-    mut points: InlineArray[Float64, 12],
-    mut edge_keys: InlineArray[Int64, 4],
+    mut points: Array[Float64, 12],
+    mut edge_keys: Array[Int64, 4],
     slot: Int,
     grid_node_count: Int,
 ):
@@ -643,8 +618,8 @@ def write_triangle(
     destination: FPtr,
     destination_keys: IPtr,
     triangle: Int,
-    points: InlineArray[Float64, 12],
-    edge_keys: InlineArray[Int64, 4],
+    points: Array[Float64, 12],
+    edge_keys: Array[Int64, 4],
     a: Int,
     b: Int,
     c: Int,
@@ -668,12 +643,16 @@ def write_triangle(
     var second = c if flip else b
     var third = b if flip else c
     for axis in range(3):
-        destination[triangle * 9 + axis] = points[a * 3 + axis]
-        destination[triangle * 9 + 3 + axis] = points[second * 3 + axis]
-        destination[triangle * 9 + 6 + axis] = points[third * 3 + axis]
-    destination_keys[triangle * 3] = edge_keys[a]
-    destination_keys[triangle * 3 + 1] = edge_keys[second]
-    destination_keys[triangle * 3 + 2] = edge_keys[third]
+        destination.unsafe_store(triangle * 9 + axis, points[a * 3 + axis])
+        destination.unsafe_store(
+            triangle * 9 + 3 + axis, points[second * 3 + axis]
+        )
+        destination.unsafe_store(
+            triangle * 9 + 6 + axis, points[third * 3 + axis]
+        )
+    destination_keys.unsafe_store(triangle * 3, edge_keys[a])
+    destination_keys.unsafe_store(triangle * 3 + 1, edge_keys[second])
+    destination_keys.unsafe_store(triangle * 3 + 2, edge_keys[third])
 
 
 @always_inline
@@ -694,11 +673,11 @@ def emit_tetrahedron(
     tetrahedron: Int,
     grid_node_count: Int,
 ) -> Int:
-    var values = InlineArray[Float64, 4](fill=0.0)
-    var coordinates = InlineArray[Float64, 12](fill=0.0)
-    var node_ids = InlineArray[Int, 4](fill=0)
-    var inside = InlineArray[Int, 4](fill=0)
-    var outside = InlineArray[Int, 4](fill=0)
+    var values = Array[Float64, 4](fill=0.0)
+    var coordinates = Array[Float64, 12](fill=0.0)
+    var node_ids = Array[Int, 4](fill=0)
+    var inside = Array[Int, 4](fill=0)
+    var outside = Array[Int, 4](fill=0)
     var inside_count = 0
     var outside_count = 0
     for corner in range(4):
@@ -708,7 +687,7 @@ def emit_tetrahedron(
         var gz = z + node_z(node)
         var index = grid_index(gx, gy, gz, nx, ny)
         node_ids[corner] = index
-        values[corner] = field[index]
+        values[corner] = field.unsafe_load(index)
         coordinates[corner * 3] = ox + spacing * Float64(gx)
         coordinates[corner * 3 + 1] = oy + spacing * Float64(gy)
         coordinates[corner * 3 + 2] = oz + spacing * Float64(gz)
@@ -733,8 +712,8 @@ def emit_tetrahedron(
         direction_y -= coordinates[inside[i] * 3 + 1] / Float64(inside_count)
         direction_z -= coordinates[inside[i] * 3 + 2] / Float64(inside_count)
 
-    var points = InlineArray[Float64, 12](fill=0.0)
-    var edge_keys = InlineArray[Int64, 4](fill=0)
+    var points = Array[Float64, 12](fill=0.0)
+    var edge_keys = Array[Int64, 4](fill=0)
     if inside_count == 1:
         crossing(values, coordinates, node_ids, inside[0], outside[0], points, edge_keys, 0, grid_node_count)
         crossing(values, coordinates, node_ids, inside[0], outside[1], points, edge_keys, 1, grid_node_count)
@@ -808,17 +787,29 @@ def mm_transform(
     var destination = fp(destination_address)
     var matrix = fp(matrix_address)
     for i in range(vertex_count):
-        var x = source[i * 3]
-        var y = source[i * 3 + 1]
-        var z = source[i * 3 + 2]
-        destination[i * 3] = (
-            matrix[0] * x + matrix[1] * y + matrix[2] * z + matrix[3]
+        var x = source.unsafe_load(i * 3)
+        var y = source.unsafe_load(i * 3 + 1)
+        var z = source.unsafe_load(i * 3 + 2)
+        destination.unsafe_store(
+            i * 3,
+            matrix.unsafe_load(0) * x
+            + matrix.unsafe_load(1) * y
+            + matrix.unsafe_load(2) * z
+            + matrix.unsafe_load(3),
         )
-        destination[i * 3 + 1] = (
-            matrix[4] * x + matrix[5] * y + matrix[6] * z + matrix[7]
+        destination.unsafe_store(
+            i * 3 + 1,
+            matrix.unsafe_load(4) * x
+            + matrix.unsafe_load(5) * y
+            + matrix.unsafe_load(6) * z
+            + matrix.unsafe_load(7),
         )
-        destination[i * 3 + 2] = (
-            matrix[8] * x + matrix[9] * y + matrix[10] * z + matrix[11]
+        destination.unsafe_store(
+            i * 3 + 2,
+            matrix.unsafe_load(8) * x
+            + matrix.unsafe_load(9) * y
+            + matrix.unsafe_load(10) * z
+            + matrix.unsafe_load(11),
         )
 
 
@@ -838,9 +829,19 @@ def mm_pairwise_sum(
     for i in range(first_count):
         for j in range(second_count):
             var base = (i * second_count + j) * 3
-            destination[base] = first[i * 3] + sign * second[j * 3]
-            destination[base + 1] = first[i * 3 + 1] + sign * second[j * 3 + 1]
-            destination[base + 2] = first[i * 3 + 2] + sign * second[j * 3 + 2]
+            destination.unsafe_store(
+                base, first.unsafe_load(i * 3) + sign * second.unsafe_load(j * 3)
+            )
+            destination.unsafe_store(
+                base + 1,
+                first.unsafe_load(i * 3 + 1)
+                + sign * second.unsafe_load(j * 3 + 1),
+            )
+            destination.unsafe_store(
+                base + 2,
+                first.unsafe_load(i * 3 + 2)
+                + sign * second.unsafe_load(j * 3 + 2),
+            )
 
 
 @export("mm_measure")
@@ -856,18 +857,18 @@ def mm_measure(
     var signed_volume = 0.0
     var area = 0.0
     for triangle in range(triangle_count):
-        var ia = Int(faces[triangle * 3]) * 3
-        var ib = Int(faces[triangle * 3 + 1]) * 3
-        var ic = Int(faces[triangle * 3 + 2]) * 3
-        var ax = vertices[ia]
-        var ay = vertices[ia + 1]
-        var az = vertices[ia + 2]
-        var bx = vertices[ib]
-        var by = vertices[ib + 1]
-        var bz = vertices[ib + 2]
-        var cx = vertices[ic]
-        var cy = vertices[ic + 1]
-        var cz = vertices[ic + 2]
+        var ia = Int(faces.unsafe_load(triangle * 3)) * 3
+        var ib = Int(faces.unsafe_load(triangle * 3 + 1)) * 3
+        var ic = Int(faces.unsafe_load(triangle * 3 + 2)) * 3
+        var ax = vertices.unsafe_load(ia)
+        var ay = vertices.unsafe_load(ia + 1)
+        var az = vertices.unsafe_load(ia + 2)
+        var bx = vertices.unsafe_load(ib)
+        var by = vertices.unsafe_load(ib + 1)
+        var bz = vertices.unsafe_load(ib + 2)
+        var cx = vertices.unsafe_load(ic)
+        var cy = vertices.unsafe_load(ic + 1)
+        var cz = vertices.unsafe_load(ic + 2)
         var cross_x = by * cz - bz * cy
         var cross_y = bz * cx - bx * cz
         var cross_z = bx * cy - by * cx
@@ -886,5 +887,5 @@ def mm_measure(
             + normal_y * normal_y
             + normal_z * normal_z
         )
-    result[0] = abs(signed_volume) / 6.0
-    result[1] = area
+    result.unsafe_store(0, abs(signed_volume) / 6.0)
+    result.unsafe_store(1, area)
