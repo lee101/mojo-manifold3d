@@ -272,7 +272,15 @@ def test_boolean_volume_and_bounds_parity(operation, op):
     ours = op(*overlapping_boxes(mm))
     theirs = op(*overlapping_boxes(upstream))
     assert_oriented_manifold(ours)
-    assert ours.volume() == pytest.approx(theirs.volume(), rel=0.012)
+    # The port is resolution-dependent, so this is not exact: at resolution 40
+    # these three booleans measured within 0.34% of upstream (union -0.19%,
+    # intersection -0.20%, difference -0.33%). The previous 1.2% bound also
+    # accepted a silently empty mesh, because `assert_oriented_manifold`
+    # returns early for one and `pytest.approx` accepts 0 for 11.32; the
+    # nonzero check below is what rules that out.
+    assert not ours.is_empty()
+    assert ours.volume() > 0
+    assert ours.volume() == pytest.approx(theirs.volume(), rel=0.01)
     assert ours.bounding_box() == pytest.approx(theirs.bounding_box(), abs=0.08)
     assert ours.genus() == theirs.genus() == 0
 
@@ -572,6 +580,65 @@ def test_signed_distance_matches_reference_for_both_widths(shape):
         -1,
     )
     assert result == pytest.approx(expected, abs=1e-12)
+
+
+def test_signed_distance_inside_sign_is_positive():
+    # The reference above makes no sign claim. `reference_signed_distance`
+    # computes `max(distance, 1e-9)` and then negates it inside, so its
+    # expected value is always negative and only `max` hides that; a kernel
+    # that negated every inside sample would pass it unchanged. The sign is
+    # correct for the default axis-aligned cube and for this rotated one
+    # (checked by ray parity in bench/verify.md), but only ray parity checks it
+    # here: a point strictly inside one face region only exists for a
+    # mesh-coincident grid, and the default cube's grid misses every one.
+    solid = mm.Manifold.cube().rotate((20.0, -15.0, 35.0))
+    spacing = 0.05
+    origin = np.array([-1.2, -1.2, -1.2])
+    shape = (49, 49, 49)
+    result = np.empty(int(np.prod(shape)))
+    lib().mm_signed_distance(
+        addr(solid._vertices),
+        addr(solid._faces),
+        len(solid._faces),
+        float(origin[0]),
+        float(origin[1]),
+        float(origin[2]),
+        spacing,
+        shape[0],
+        shape[1],
+        shape[2],
+        addr(result, writable=True),
+        -1,
+    )
+    result = result.reshape(shape)
+    direction = np.array(RAY_DIRECTION)
+    inside_points = 0
+    for z in range(0, shape[2], 4):
+        for y in range(0, shape[1], 4):
+            for x in range(0, shape[0], 4):
+                point = origin + spacing * np.array([x, y, z], dtype=np.float64)
+                hits = 0
+                for a, b, c in solid._vertices[solid._faces]:
+                    ab, ac = b - a, c - a
+                    ap = point - a
+                    h = np.cross(direction, ac)
+                    det = ab @ h
+                    if abs(det) <= 1.0e-14:
+                        continue
+                    inv = 1.0 / det
+                    u = (ap @ h) * inv
+                    q = np.cross(ap, ab)
+                    v = (direction @ q) * inv
+                    t = (ac @ q) * inv
+                    if 0.0 <= u <= 1.0 and v >= 0.0 and u + v <= 1.0:
+                        if t > 1.0e-12:
+                            hits += 1
+                if hits % 2:
+                    inside_points += 1
+                    assert result[z, y, x] > 0
+                else:
+                    assert result[z, y, x] < 0
+    assert inside_points > 50
 
 
 def test_weld_crossings_dense_path_matches_sorted_path():

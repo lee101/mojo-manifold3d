@@ -173,11 +173,12 @@ capture convention, which is what `parallelize` accepts as
 `def(Int) -> None`.
 
 **Threshold.** Measured, not guessed. The cost that decides it is the worker
-pool start-up: the first parallel call in a process pays about 4.3-4.9 ms
-before any worker runs, and that cost is independent of the grid. Serial
-therefore wins up to roughly the point where one thread's work is itself on the
-order of several milliseconds. On this host that is 50,000-64,000 points for
-this kernel (table below). With a 16x margin for a busier host and a
+pool start-up: for grids that are pure start-up (512 to 32,768 points) the
+parallel cells in this session's sweep took 4.66-7.38 ms, so the start-up is
+about 4.6-4.8 ms, and it is independent of the grid. Serial therefore wins
+up to roughly the point where one thread's work is itself on the order of
+several milliseconds. On this host that is 50,000-110,592 points for this
+kernel (table below). With a 16x margin for a busier host and a
 smaller-mesh caller, the threshold is **1,000,000 grid points**. Below it the
 call is serial; every boolean at the shipped default resolution is below it.
 
@@ -188,21 +189,24 @@ flattens, and the cap is 4. The column is recorded here rather than taken.
 
 | points | serial | 2 workers | 4 workers | 4 / 1 |
 |---:|---:|---:|---:|---:|
-| 512 | 0.03 ms | 4.38 ms | 4.24 ms | 0.01x |
-| 8,000 | 0.54 ms | 5.25 ms | 4.56 ms | 0.12x |
-| 32,768 | 1.96 ms | 5.32 ms | 4.89 ms | 0.40x |
-| 64,000 | 3.76 ms | 6.49 ms | 5.37 ms | 0.70x |
-| 110,592 | 6.40 ms | 7.78 ms | 6.23 ms | 1.03x |
-| 262,144 | 14.79 ms | 12.34 ms | 8.42 ms | 1.76x |
-| 884,736 | 49.84 ms | 36.14 ms | 31.09 ms | 1.60x |
-| 2,097,152 | 154.17 ms | 70.49 ms | 40.70 ms | 3.79x |
-| 7,077,888 | 436.06 ms | 238.20 ms | 115.68 ms | 3.77x |
+| 512 | 0.029 ms | 4.742 ms | 4.659 ms | 0.01x |
+| 8,000 | 0.451 ms | 5.241 ms | 4.949 ms | 0.09x |
+| 32,768 | 1.851 ms | 6.965 ms | 7.379 ms | 0.25x |
+| 64,000 | 3.708 ms | 7.188 ms | 5.879 ms | 0.63x |
+| 110,592 | 6.196 ms | 7.917 ms | 5.975 ms | 1.04x |
+| 262,144 | 15.583 ms | 13.546 ms | 8.955 ms | 1.74x |
+| 884,736 | 50.587 ms | 37.629 ms | 25.132 ms | 2.01x |
+| 2,097,152 | 119.459 ms | 71.172 ms | 38.665 ms | 3.09x |
+| 7,077,888 | 419.804 ms | 255.658 ms | 136.094 ms | 3.08x |
 
 `bench/parallel_crossover.cc` reproduces the table: it calls the exported
 kernel directly from C++, so no interpreter runs between launches. Every cell
 is the best of 3-15 calls. The crossover is where the 4-worker column overtakes
-the serial column, 64,000-110,592 points; two workers only match serial there
-because they pay the same start-up.
+the serial column, 64,000-110,592 points; this run's 32,768-point 4-worker cell
+(7.379 ms) was slower than its 2-worker cell (6.965 ms), so that row is noise in
+the start-up cost rather than a trend. Two workers only match serial near the
+crossover because they pay the same start-up.
+
 
 The grid is split into a task count that depends only on the grid (`row_tasks`:
 one task per row down to 16, capped at 4096), never on the worker count. Each
@@ -218,10 +222,11 @@ detected and evaluated once.
 sits in the 36,000-91,000 point range, below the threshold, so it takes the
 serial path and its timing is unchanged. The parallel path only engages for
 callers that raise the resolution, and those are the ones where it pays. Same
-build, same host, measured back to back with the field pinned serial and at the
-cap, the raw kernel at 127 samples across (1,998,592 points) goes from 1,970.5
-ms to 516.8 ms at 4 workers, a 3.8x gain at that size. With 8 workers the same
-call measured 255.6 ms, but that is past the cap and is not used.
+build, same host, measured with `mm_signed_distance_data` at 126 samples across
+(2,000,376 points), best of 3: 896.4 ms with one worker to 253.3 ms at 4, a
+3.54x gain. The table row at the same size in this session's C++ sweep was
+3.09x; the two harnesses share a start-up cost of the same order, so the gap is
+the shared host.
 
 ### GPU path behind a measured size gate
 
@@ -231,26 +236,34 @@ memory-bound or far too small, so it is **CPU only: memory-bound**. The GPU path
 is one kernel launch per call over the whole grid, with the mesh and the field
 copied in once and the field copied out once.
 
-It is also the one path here that loses at the sizes real callers pass. Measured
-on the host below with the exported pair kernel called directly (no interpreter
-between launches), same geometry as the benchmark's sphere-box difference, best
-of two to three calls:
+It is also the one path here whose advantage depends on the toolchain's device
+start-up. Measured on the host below with the exported pair kernel called
+directly (no interpreter between launches), same geometry as the benchmark's
+sphere-box difference, best of three calls after one warm-up call:
 
 | resolution | grid | points | CPU | GPU | GPU / CPU |
 |---:|---|---:|---:|---:|---:|
-| 28 | 33 x 33 x 33 | 35,937 | 44.2-47.5 ms | 72.2-83.8 ms | 0.53-0.65x |
-| 40 | 45 x 45 x 45 | 91,125 | 133.1 ms | 34.1 ms | 3.90x |
-| 60 | 65 x 64 x 64 | 266,240 | 328.7 ms | 361.8 ms | 0.91x |
-| 80 | 85 x 84 x 84 | 599,760 | 728.8 ms | 780.8 ms | 0.93x |
+| 28 | 33 x 33 x 33 | 35,937 | 44.4 ms | 2.9 ms | 0.06x |
+| 40 | 45 x 45 x 45 | 91,125 | 131.1 ms | 3.8 ms | 0.03x |
+| 60 | 65 x 64 x 64 | 266,240 | 315.7 ms | 4.1 ms | 0.01x |
+| 80 | 85 x 84 x 84 | 599,760 | 706.3 ms | 16.7 ms | 0.02x |
 
-Arrays agreed with the CPU path to 4.1e-15 and less on every row. The numbers do
-not rise monotonically because the CPU side has its own crossover: below
-1,000,000 points the field is evaluated serially, and the GPU's fixed
-copy-in, launch, and copy-out cost is larger than the whole serial evaluation at
-35,937 points. The shipped boolean resolutions are 28 and 40, so the explicit
-GPU request is left opt-in and gated: **`GPU_MIN_POINTS = 1_000_000`**. Below it
+(GPU / CPU is GPU time over CPU time, so a smaller figure is a larger GPU
+gain.) Arrays agreed with the CPU path to 7.0e-15 and less on every row. The
+one slow GPU measurement in this session was the first device call in a fresh
+process, 337.1 ms at 33^3 before any warm-up; every later call at that size was
+3 ms or less, so that is device start-up, not a per-call cost.
+
+The shipped boolean resolutions are 28 and 40, where the kernel is 0.06x and
+0.03x of the serial CPU time. Even so the explicit GPU request is left opt-in
+and gated at **`GPU_MIN_POINTS = 1_000_000`**, because the gate is set from
+the serial/parallel crossover rather than from this table, it predates these
+measurements, and the whole-boolean cost is dominated by passes the device
+does not touch (see the benchmarks section). Below the gate
 `Manifold.boolean(..., device="gpu")` runs the CPU path and warns why. Plain
 boolean operators never request the device, so the default path is unchanged.
+Whether the gate should be removed is a decision for the maintainers, not a
+measurement; this section records what the kernel does.
 
 The GPU path keeps the toolchain's `max.gpu.host.DeviceContext` with
 `block_idx`/`thread_idx` from `max.gpu`. The grid is `(count + 255) // 256`
@@ -323,27 +336,27 @@ was nothing to verify.
 ## Benchmarks
 
 Measured with `pixi run bench` on an Intel Xeon E5-2697 v4 at 2.30 GHz,
-Linux 6.8.0-139-generic. Each number is the best complete Python API call from
+Linux 6.8.0-147-generic. Each number is the best complete Python API call from
 the benchmark's repeat count. The "before" column is the same table measured on
-the same idle host from the pre-optimisation tree, rebuilt from source and run
-back to back with the "now" column. This is a shared machine and repeated runs
-move by up to 20% in both directions, so the table is one run rather than a
-best-of, and the ratios below are from those two runs. The table was measured
-before the parallel path landed. The boolean rows sit below the parallelism
-threshold, so the path they take did not change; the parallel path's own
-numbers, measured separately on the same host, are in
+the same host from the pre-optimisation tree (`5272194`), rebuilt from source
+and run interleaved with the "now" column over five rounds. This is a shared
+machine and repeated runs move by up to 30% in both directions, so the table is
+one run rather than a best-of, and the ratios below are from that one run. The
+table was measured before the parallel path landed. The boolean rows sit below
+the parallelism threshold, so the path they take did not change; the parallel
+path's own numbers, measured separately on the same host, are in
 [CPU parallelism behind a measured threshold](#cpu-parallelism-behind-a-measured-threshold).
 
 | case | before | mojo-manifold3d | manifold3d 3.5.2 | relative |
 |---|---:|---:|---:|---:|
-| volume + surface area (2,048 tri) | 0.074 ms | 0.001 ms | 0.073 ms | 73.861x faster |
-| affine transform + mesh (1,026 vert) | 0.152 ms | 0.132 ms | 0.294 ms | 2.234x faster |
-| convex hull (10,000 points) | 4.318 ms | 4.720 ms | 0.704 ms | 0.149x slower |
-| Minkowski sum (66 x 8 vertices) | 6.239 ms | 3.427 ms | 2.974 ms | 0.868x slower |
-| box union (resolution 28) | 83.907 ms | 42.040 ms | 0.330 ms | 0.008x slower |
-| sphere-box difference (resolution 28) | 203.509 ms | 95.817 ms | 0.632 ms | 0.007x slower |
+| volume + surface area (2,048 tri) | 0.058 ms | 0.001 ms | 0.089 ms | 63.490x faster |
+| affine transform + mesh (1,026 vert) | 0.096 ms | 0.104 ms | 0.370 ms | 3.544x faster |
+| convex hull (10,000 points) | 2.947 ms | 3.190 ms | 0.488 ms | 0.153x slower |
+| Minkowski sum (66 x 8 vertices) | 4.031 ms | 2.521 ms | 2.570 ms | 1.020x faster |
+| box union (resolution 28) | 53.625 ms | 26.988 ms | 0.390 ms | 0.014x slower |
+| sphere-box difference (resolution 28) | 77.664 ms | 62.097 ms | 0.783 ms | 0.013x slower |
 
-- The two boolean rows are 2.0x and 2.1x faster than this port's own previous
+- The two boolean rows are 2.0x and 1.25x faster than this port's own previous
   build. They stay far behind upstream because upstream is a parallel C++
   exact-mesh engine and this port evaluates a dense signed-distance grid below
   the parallelism threshold to get a simple, explicit manifold guarantee. The
@@ -354,28 +367,37 @@ numbers, measured separately on the same host, are in
   essentially all of it, nothing in this repository runs on that path, and the
   two columns differ only by run-to-run noise: replacing Qhull with a Mojo
   quickhull is a different project, not an optimisation.
-- The Minkowski row is 1.8x faster than before and now at parity with upstream,
-  where it straddles between runs (0.8x slower to 1.4x faster). It is
-  dominated by two Qhull calls, one for the sphere and one for the expanded
-  point cloud.
+- The Minkowski row is 1.6x faster than before and at parity with upstream. It
+  is dominated by two Qhull calls, one for the sphere and one for the expanded
+  point cloud, which is why the two columns differ only by noise.
 - The affine transform row is untouched by this work and its two columns
   differ only by noise; it was already ahead of upstream.
 - `volume()` and `surface_area()` on the same solid share one measurement pass.
   The buffers they read never change after construction, so the result is
-  cached on the instance. A single cold `volume()` call still costs about
-  0.05 ms; the benchmark measures the pair, which is what a caller asks for.
+  cached on the instance. The benchmark measures the pair on an already-warm
+  solid, so its 0.001 ms is a cache hit; a cold `volume()` on a new solid still
+  costs about 0.055 ms, which is what the "before" column shows.
 
-The GPU row below is the historical `pixi run bench` output from before the size
-gate. It is **not** reproducible now: at resolution 40 the grid is 91,125 points,
-below `GPU_MIN_POINTS`, so `device="gpu"` takes the CPU path and the two columns
-would be the same call. `bench/bench.py` refuses to print a GPU row unless the
-device path actually ran, so a fresh run prints no GPU table. The raw kernel
-numbers that decided the gate are in
-[GPU path behind a measured size gate](#gpu-path-behind-a-measured-size-gate).
 
-| GPU case | CPU before | CPU now | GPU | acceleration |
+The GPU row below is not reproducible from `pixi run bench` on the shipped
+gate: at resolution 40 the grid is 91,125 points, below `GPU_MIN_POINTS`, so
+`device="gpu"` takes the CPU path and the two columns would be the same call.
+`bench/bench.py` refuses to print a GPU row unless the device path actually ran,
+so a fresh run prints no GPU table. Measured in a separate process with the
+gate bypassed (`GPU_MIN_POINTS = 0` and the memory probe stubbed True, which is
+what the tests do so the device path is exercised), the first pass starts the
+device and later passes do not, so both columns are shown:
+
+| GPU case | CPU (first call) | CPU (later) | GPU (first call) | GPU (later) |
 |---|---:|---:|---:|---:|
-| sphere-box difference (resolution 40) | 508.768 ms | 236.943 ms | 128.463 ms | 1.844x |
+| sphere-box difference (resolution 40) | 161.7 ms | 185.1 ms | 39.3 ms | 42.4 ms |
+
+Both paths return the same volume, 2.182260707. The GPU column here is the
+whole boolean, not only the field kernel, so it includes the per-call copy-in
+and copy-out; the kernel-only numbers that decided the gate are in
+[GPU path behind a measured size gate](#gpu-path-behind-a-measured-size-gate),
+and they are restated there because the first-call cost they were measured
+with is a device start-up, not a per-call cost.
 
 Run `pixi run bench` to reproduce the table under the repository's
 machine-wide benchmark lock. `pixi run python bench/parallel.py` compares the
