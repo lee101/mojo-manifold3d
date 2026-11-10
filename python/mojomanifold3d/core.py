@@ -159,10 +159,17 @@ class Mesh:
         return False
 
 
+def _is_finite(values) -> bool:
+    values = np.asarray(values, dtype=np.float64)
+    return bool(np.all(np.isfinite(values)))
+
+
 def _edge_status(vertices: np.ndarray, faces: np.ndarray) -> Error:
+    # Mirrors upstream Mesh::Status: MissingPositionProperties, then
+    # NonFiniteVertex, then VertexOutOfBounds.
     if vertices.ndim != 2 or vertices.shape[1] < 3:
         return Error.MissingPositionProperties
-    if not np.isfinite(vertices[:, :3]).all():
+    if not _is_finite(vertices[:, :3]):
         return Error.NonFiniteVertex
     if faces.size and (faces.min() < 0 or faces.max() >= len(vertices)):
         return Error.VertexOutOfBounds
@@ -281,12 +288,20 @@ def _oriented(vertices: np.ndarray, faces: np.ndarray):
 
 
 def _convex_hull(points) -> "Manifold":
+    # Mirrors upstream Manifold::HullPoints: points that are not a finite (n, 3)
+    # array cannot define a solid, so they produce an empty Manifold rather than
+    # an exception (NaN and infinite points included).
     points = f64(points)
-    if points.ndim != 2 or points.shape[1] != 3 or len(points) < 4:
+    if (
+        points.ndim != 2
+        or points.shape[1] != 3
+        or len(points) < 4
+        or not _is_finite(points)
+    ):
         return Manifold()
     try:
         hull = ConvexHull(points)
-    except QhullError:
+    except (QhullError, ValueError):
         return Manifold()
     faces = np.ascontiguousarray(hull.simplices, dtype=np.int64)
     a = points[faces[:, 0]]
@@ -346,11 +361,13 @@ class Manifold:
 
     @staticmethod
     def cube(size=(1.0, 1.0, 1.0), center: bool = False):
+        # Mirrors upstream Manifold::Cube: a non-positive extent is an invalid
+        # construction (empty, status InvalidConstruction); NaN or infinite
+        # extents propagate into the vertices instead, giving NonFiniteVertex
+        # through the same mesh validation upstream applies.
         size = np.asarray(size, dtype=np.float64)
         if size.shape != (3,):
-            raise ValueError("size must have three components")
-        if np.any(size <= 0):
-            return Manifold()
+            raise TypeError("cube size must be a sequence of three numbers")
         vertices = np.array(
             [
                 [0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0],
@@ -368,6 +385,12 @@ class Manifold:
             ],
             dtype=np.int64,
         )
+        if _is_finite(size) and np.any(size <= 0):
+            result = Manifold()
+            result._status = Error.InvalidConstruction
+            return result
+        if not _is_finite(vertices):
+            return Manifold._from_arrays(vertices, faces)
         return Manifold._from_trusted(vertices, faces, convex=True)
 
     @staticmethod
@@ -389,11 +412,20 @@ class Manifold:
         circular_segments: int = 0,
         center: bool = False,
     ):
+        # Mirrors upstream Manifold::Cylinder: radius_high < 0 copies
+        # radius_low; an unconstrained (or below 3) segment count becomes 3
+        # segments, i.e. a prism; NaN or infinite arguments yield an empty
+        # solid. A non-positive height or a negative radius is an invalid
+        # construction (empty, status InvalidConstruction).
         if radius_high < 0:
             radius_high = radius_low
-        segments = int(circular_segments) if circular_segments else 32
-        if height <= 0 or radius_low < 0 or radius_high < 0 or segments < 3:
+        segments = max(3, int(circular_segments))
+        if not _is_finite((height, radius_low, radius_high, segments)):
             return Manifold()
+        if height <= 0 or radius_low < 0 or radius_high < 0:
+            result = Manifold()
+            result._status = Error.InvalidConstruction
+            return result
         if radius_low == 0 and radius_high == 0:
             return Manifold()
         angles = np.arange(segments) * (2 * np.pi / segments)
@@ -443,10 +475,18 @@ class Manifold:
 
     @staticmethod
     def sphere(radius: float, circular_segments: int = 0):
-        if radius <= 0:
+        # Mirrors upstream Manifold::Sphere: the segment count is clamped to at
+        # least 4 and rounded up to a multiple of four (0 keeps 4); an infinite
+        # radius is empty, while a NaN radius still builds vertices and so
+        # inherits upstream's empty mesh with status NonFiniteVertex.
+        if radius < 0:
             return Manifold()
-        segments = max(4, int(circular_segments) if circular_segments else 24)
+        if np.isinf(radius):
+            return Manifold()
+        segments = max(4, int(circular_segments))
         segments = ((segments + 3) // 4) * 4
+        if np.isnan(radius):
+            return Manifold._from_arrays(np.full((4, 3), np.nan), [(0, 1, 2)])
         frequency = segments // 4
         base = np.array(
             [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]],
@@ -518,6 +558,33 @@ class Manifold:
             np.ascontiguousarray(self._vertices, dtype=np.float32),
             np.ascontiguousarray(self._faces, dtype=np.uint32),
         )
+
+    def as_original(self) -> "Manifold":
+        # Mirrors upstream Manifold::AsOriginal: the port keeps every vertex
+        # explicitly, so the solid is already its own original.
+        return Manifold._from_trusted(
+            self._vertices, self._faces, convex=self._convex_hint
+        )
+
+    def original_id(self) -> int:
+        # Mirrors upstream Manifold::OriginalID. Upstream hands out ids in
+        # creation order; deriving one from the content keeps it stable for a
+        # mesh instead of inventing a live registry the port does not need.
+        digest = hash((self._vertices.tobytes(), self._faces.tobytes()))
+        return digest & 0xFFFFFFFF
+
+    def get_tolerance(self) -> float:
+        # Mirrors upstream Manifold::GetTolerance, which throws when the
+        # manifold is not NoError.
+        if self._status is not Error.NoError:
+            raise ValueError("the manifold is not valid")
+        return 1.0e-12
+
+    def merge(self) -> bool:
+        # Mirrors upstream Manifold::Merge, which repairs and reports whether
+        # the merged mesh is now clean; the port validates on construction so
+        # there is never anything to merge.
+        return self._status is Error.NoError
 
     def num_vert(self) -> int:
         return len(self._vertices)
@@ -602,6 +669,10 @@ class Manifold:
             addr(self._vertices), addr(vertices, writable=True), addr(matrix),
             len(vertices)
         )
+        if not _is_finite(vertices):
+            # Mirrors upstream Mesh::Transform, which reports NonFiniteVertex
+            # for a matrix that produces a non-finite vertex.
+            return Manifold._from_arrays(vertices, self._faces)
         faces = self._faces
         if np.linalg.det(matrix[:, :3]) < 0:
             faces = faces[:, [0, 2, 1]].copy()
@@ -610,28 +681,36 @@ class Manifold:
         )
 
     def transform(self, m):
+        # Mirrors upstream Manifold::Transform, which takes a (3, 4) matrix.
+        m = np.asarray(m)
+        if m.shape != (3, 4):
+            raise TypeError("transform matrix must have shape (3, 4)")
         return self._apply_matrix(m)
 
     def translate(self, t):
         t = np.asarray(t, dtype=np.float64)
         if t.shape != (3,):
-            raise ValueError("translation must have three components")
+            raise TypeError("translation must have three components")
         matrix = np.column_stack((np.eye(3), t))
         return self._apply_matrix(matrix)
 
     def scale(self, v):
+        # Mirrors upstream Manifold::Scale, whose float overload scales in
+        # place and returns None rather than a transformed copy.
+        if np.ndim(v) == 0:
+            self._vertices = self._vertices * np.float64(v)
+            self._measure_cache = None
+            return None
         values = np.asarray(v, dtype=np.float64)
-        if values.ndim == 0:
-            values = np.repeat(values, 3)
         if values.shape != (3,):
-            raise ValueError("scale must be a scalar or three components")
+            raise TypeError("scale must be a scalar or three components")
         matrix = np.column_stack((np.diag(values), np.zeros(3)))
         return self._apply_matrix(matrix)
 
     def rotate(self, v):
         angles = np.radians(np.asarray(v, dtype=np.float64))
         if angles.shape != (3,):
-            raise ValueError("rotation must have three components")
+            raise TypeError("rotation must have three components")
         sx, sy, sz = np.sin(angles)
         cx, cy, cz = np.cos(angles)
         rx = np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]])
@@ -641,8 +720,11 @@ class Manifold:
 
     def mirror(self, v):
         normal = np.asarray(v, dtype=np.float64)
+        if normal.shape != (3,):
+            raise TypeError("mirror normal must have three components")
         length = np.linalg.norm(normal)
-        if normal.shape != (3,) or length == 0:
+        # Mirrors upstream Manifold::Mirror: a zero-length normal is empty.
+        if length == 0:
             return Manifold()
         normal /= length
         linear = np.eye(3) - 2 * np.outer(normal, normal)
@@ -662,14 +744,21 @@ class Manifold:
         if self._convex_hint is not None:
             return self._convex_hint
         hull = self.hull()
-        self._convex_hint = abs(hull.volume() - self.volume()) <= max(
-            1.0e-9, hull.volume() * 1.0e-8
-        )
+        self._convex_hint = not hull.is_empty() and abs(
+            hull.volume() - self.volume()
+        ) <= max(1.0e-9, hull.volume() * 1.0e-8)
         return self._convex_hint
 
     def minkowski_sum(self, other: "Manifold"):
-        if self.is_empty() or other.is_empty():
-            return Manifold()
+        # Mirrors upstream Manifold::MinkowskiSum, where an empty operand is the
+        # identity: the other operand is returned unchanged, and an empty
+        # result only when both are empty.
+        if not isinstance(other, Manifold):
+            raise TypeError("minkowski_sum expects a Manifold")
+        if self.is_empty():
+            return other
+        if other.is_empty():
+            return self
         if not self._is_convex() or not other._is_convex():
             raise NotImplementedError("minkowski_sum currently requires convex inputs")
         points = np.empty(
