@@ -1,10 +1,11 @@
 """Geometry kernels exported through a stable C ABI.
 
 Python owns every buffer. Addresses cross the ABI as Int so exported
-functions stay non-parametric. The CPU kernels are single-threaded: this
-toolchain has no `parallelize`, so grid work runs in one serial loop.
+functions stay non-parametric. CPU kernels are serial below their measured
+crossover and fan out through `max.algorithm.parallelize` above it.
 """
 
+from max.algorithm import parallelize
 from max.gpu import block_dim, block_idx, thread_idx
 from max.gpu.host import DeviceContext
 from std.math import sqrt
@@ -404,8 +405,30 @@ def sdf_point(
     result.unsafe_store(point, distance if hits % 2 == 1 else -distance)
 
 
-@export("mm_signed_distance")
-def mm_signed_distance(
+comptime PARALLEL_POINTS_THRESHOLD = 1_000_000
+# Measured on the shared host: 2 and 4 workers both remove the pool start-up
+# cost that makes the first parallel boolean slow; 4 is the cap this port takes.
+comptime PARALLEL_WORKERS = 4
+# Fixed task count keeps the output independent of the worker count: each task
+# owns one fixed row range, so the split never depends on how many workers run.
+comptime PARALLEL_TASKS = 16
+comptime MAX_ROW_TASKS = 4096
+
+
+@always_inline
+def row_tasks(rows: Int) -> Int:
+    # Fixed split: one task per row down to PARALLEL_TASKS, capped at
+    # MAX_ROW_TASKS. The count depends only on the grid, never on the worker
+    # count, so every worker configuration produces an identical grid.
+    if rows > MAX_ROW_TASKS:
+        return MAX_ROW_TASKS
+    if rows > PARALLEL_TASKS:
+        return rows
+    return PARALLEL_TASKS
+
+
+@export("mm_signed_distance_data")
+def mm_signed_distance_data(
     vertices_address: Int,
     faces_address: Int,
     triangle_count: Int,
@@ -417,10 +440,35 @@ def mm_signed_distance(
     ny: Int,
     nz: Int,
     result_address: Int,
-) abi("C"):
-    var vertices = fp(vertices_address)
-    var faces = ip(faces_address)
-    var result = fp(result_address)
+    workers: Int,
+) abi("C") -> Int:
+    # Test entry point: any worker count, threshold bypassed, still capped.
+    # Lets the parity test compare worker counts on the same input.
+    signed_distance_grid(
+        fp(vertices_address), ip(faces_address), triangle_count,
+        ox, oy, oz, spacing, nx, ny, nz, fp(result_address),
+        min(max(workers, 1), PARALLEL_WORKERS),
+    )
+    return 1
+
+
+def signed_distance_grid(
+    vertices: FPtr,
+    faces: IPtr,
+    triangle_count: Int,
+    ox: Float64,
+    oy: Float64,
+    oz: Float64,
+    spacing: Float64,
+    nx: Int,
+    ny: Int,
+    nz: Int,
+    result: FPtr,
+    workers: Int,
+):
+    # `workers == 1` is the serial path: the same task bodies, no launch.
+    # Every row writes only its own samples and each row's value is computed by
+    # the same code, so every worker count produces a bit-identical grid.
     var row_stride = nx * ny
     if nx < W:
         for z in range(nz):
@@ -435,9 +483,15 @@ def mm_signed_distance(
                     )
         return
     var vector_end = nx // W * W
-    for z in range(nz):
-        var pz = oz + spacing * Float64(z)
-        for y in range(ny):
+    var rows = ny * nz
+    var tasks = row_tasks(rows)
+    def work(task: Int) {imm}:
+        var first_row = task * rows // tasks
+        var last_row = (task + 1) * rows // tasks
+        for flat_row in range(first_row, last_row):
+            var z = flat_row // ny
+            var y = flat_row - z * ny
+            var pz = oz + spacing * Float64(z)
             var row = z * row_stride + y * nx
             var py = oy + spacing * Float64(y)
             var x = 0
@@ -454,6 +508,188 @@ def mm_signed_distance(
                     vertices, faces, triangle_count, ox, spacing,
                     row, py, pz, nx - W, result,
                 )
+
+    # The serial path runs the same task bodies on the caller's thread. The
+    # parallel path walks the same fixed ranges, so the output is identical.
+    if workers <= 1:
+        for task in range(tasks):
+            work(task)
+    else:
+        parallelize(work, tasks, workers)
+
+
+def signed_distance_pair(
+    vertices: FPtr,
+    faces: IPtr,
+    triangle_count: Int,
+    other_vertices: FPtr,
+    other_faces: IPtr,
+    other_triangle_count: Int,
+    ox: Float64,
+    oy: Float64,
+    oz: Float64,
+    spacing: Float64,
+    nx: Int,
+    ny: Int,
+    nz: Int,
+    result: FPtr,
+    other_result: FPtr,
+    workers: Int,
+):
+    # One launch evaluates both meshes: each task owns a fixed row range and
+    # runs the same row body for the first mesh and then the second. Worker
+    # count does not change the split, so the output is bit-identical.
+    var row_stride = nx * ny
+    if nx < W:
+        # Scalar fallback, the same one the single-mesh kernel uses.
+        for z in range(nz):
+            var pz = oz + spacing * Float64(z)
+            for y in range(ny):
+                var py = oy + spacing * Float64(y)
+                for x in range(nx):
+                    var point = z * row_stride + y * nx + x
+                    var px = ox + spacing * Float64(x)
+                    sdf_point(
+                        vertices, faces, triangle_count,
+                        px, py, pz, spacing, result, point,
+                    )
+                    sdf_point(
+                        other_vertices, other_faces, other_triangle_count,
+                        px, py, pz, spacing, other_result, point,
+                    )
+        return
+    var vector_end = nx // W * W
+    var rows = ny * nz
+    var tasks = row_tasks(rows)
+    def work(task: Int) {imm}:
+        var first_row = task * rows // tasks
+        var last_row = (task + 1) * rows // tasks
+        for mesh in range(2):
+            var mesh_triangles = (
+                triangle_count if mesh == 0 else other_triangle_count
+            )
+            if mesh_triangles == 0:
+                continue
+            var mesh_vertices = (
+                vertices if mesh == 0 else other_vertices
+            )
+            var mesh_faces = faces if mesh == 0 else other_faces
+            var mesh_result = result if mesh == 0 else other_result
+            for flat_row in range(first_row, last_row):
+                var z = flat_row // ny
+                var y = flat_row - z * ny
+                var pz = oz + spacing * Float64(z)
+                var row = z * row_stride + y * nx
+                var py = oy + spacing * Float64(y)
+                var x = 0
+                while x < vector_end:
+                    sdf_chunk(
+                        mesh_vertices, mesh_faces, mesh_triangles,
+                        ox, spacing, row, py, pz, x, mesh_result,
+                    )
+                    x += W
+                if vector_end < nx:
+                    sdf_chunk(
+                        mesh_vertices, mesh_faces, mesh_triangles,
+                        ox, spacing, row, py, pz, nx - W, mesh_result,
+                    )
+
+    # The serial path runs the same task bodies on the caller's thread. The
+    # parallel path walks the same fixed ranges, so the output is identical.
+    if workers <= 1:
+        for task in range(tasks):
+            work(task)
+    else:
+        parallelize(work, tasks, workers)
+
+
+@export("mm_signed_distance_pair")
+def mm_signed_distance_pair(
+    first_vertices_address: Int,
+    first_faces_address: Int,
+    first_triangle_count: Int,
+    second_vertices_address: Int,
+    second_faces_address: Int,
+    second_triangle_count: Int,
+    ox: Float64,
+    oy: Float64,
+    oz: Float64,
+    spacing: Float64,
+    nx: Int,
+    ny: Int,
+    nz: Int,
+    first_result_address: Int,
+    second_result_address: Int,
+    workers: Int,
+) abi("C"):
+    var first_vertices = fp(first_vertices_address)
+    var second_vertices = fp(second_vertices_address)
+    var first_result = fp(first_result_address)
+    var second_result = fp(second_result_address)
+    # Identical geometry (a solid unioned with itself, or two handles to one
+    # mesh) needs one grid, not two: both fields hold the same values, so the
+    # second result is a copy of the first.
+    if (
+        first_vertices_address == second_vertices_address
+        and first_faces_address == second_faces_address
+        and first_triangle_count == second_triangle_count
+        and first_result_address != second_result_address
+    ):
+        signed_distance_grid(
+            first_vertices, ip(first_faces_address), first_triangle_count,
+            ox, oy, oz, spacing, nx, ny, nz, first_result,
+            effective_workers(workers, nx * ny * nz),
+        )
+        var count = nx * ny * nz
+        for i in range(count):
+            second_result.unsafe_store(i, first_result.unsafe_load(i))
+        return
+    # Below the vector width the pair body falls back to the scalar path, the
+    # same as the single-mesh kernel.
+    var active = effective_workers(workers, nx * ny * nz)
+    if nx < W:
+        active = 1
+    signed_distance_pair(
+        first_vertices, ip(first_faces_address), first_triangle_count,
+        second_vertices, ip(second_faces_address), second_triangle_count,
+        ox, oy, oz, spacing, nx, ny, nz, first_result, second_result, active,
+    )
+
+
+@always_inline
+def effective_workers(workers: Int, point_count: Int) -> Int:
+    # -1 asks for the compiled-in count, 0 by mistake is still one worker.
+    # Below the measured threshold any request above one stays serial.
+    var active = workers
+    if active == 0:
+        active = 1
+    elif active == -1:
+        active = PARALLEL_WORKERS
+    if active > 1 and point_count < PARALLEL_POINTS_THRESHOLD:
+        active = 1
+    return active
+
+
+@export("mm_signed_distance")
+def mm_signed_distance(
+    vertices_address: Int,
+    faces_address: Int,
+    triangle_count: Int,
+    ox: Float64,
+    oy: Float64,
+    oz: Float64,
+    spacing: Float64,
+    nx: Int,
+    ny: Int,
+    nz: Int,
+    result_address: Int,
+    workers: Int,
+) abi("C"):
+    var active = effective_workers(workers, nx * ny * nz)
+    signed_distance_grid(
+        fp(vertices_address), ip(faces_address), triangle_count,
+        ox, oy, oz, spacing, nx, ny, nz, fp(result_address), active,
+    )
 
 
 

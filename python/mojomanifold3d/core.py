@@ -14,6 +14,9 @@ from scipy.spatial import ConvexHull, HalfspaceIntersection, QhullError
 from ._lib import addr, f64, i64, lib
 
 _CSG_RESOLUTION = 40
+# -1 asks Mojo for its measured worker count; the kernels fall back to serial
+# below their own size threshold. Tests pin this to compare worker counts.
+_SIGNED_DISTANCE_WORKERS = -1
 
 
 class OpType(Enum):
@@ -861,6 +864,7 @@ def _field(solid: Manifold, origin, spacing, shape):
         ny,
         nz,
         addr(result, writable=True),
+        _SIGNED_DISTANCE_WORKERS,
     )
     return result
 
@@ -911,10 +915,34 @@ def _field_pair(first, second, origin, spacing, shape, *, device):
             RuntimeWarning,
             stacklevel=2,
         )
-    return (
-        _field(first, origin, spacing, shape),
-        _field(second, origin, spacing, shape),
+    return _field_pair_cpu(first, second, origin, spacing, shape)
+
+
+def _field_pair_cpu(first, second, origin, spacing, shape):
+    # One Mojo call evaluates both grids, so a parallel boolean pays for one
+    # worker launch rather than two. Identical geometry is detected in Mojo.
+    nx, ny, nz = shape
+    first_result = np.empty(nx * ny * nz, dtype=np.float64)
+    second_result = np.empty(nx * ny * nz, dtype=np.float64)
+    lib().mm_signed_distance_pair(
+        addr(first._vertices),
+        addr(first._faces),
+        len(first._faces),
+        addr(second._vertices),
+        addr(second._faces),
+        len(second._faces),
+        float(origin[0]),
+        float(origin[1]),
+        float(origin[2]),
+        float(spacing),
+        nx,
+        ny,
+        nz,
+        addr(first_result, writable=True),
+        addr(second_result, writable=True),
+        _SIGNED_DISTANCE_WORKERS,
     )
+    return first_result, second_result
 
 
 def _boolean(

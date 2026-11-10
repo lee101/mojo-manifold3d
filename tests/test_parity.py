@@ -476,6 +476,7 @@ def test_signed_distance_matches_reference_for_both_widths(shape):
         shape[1],
         shape[2],
         addr(result, writable=True),
+        -1,
     )
     assert result == pytest.approx(expected, abs=1e-12)
 

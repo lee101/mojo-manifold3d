@@ -12,6 +12,12 @@ the upstream C++ extension. The test environment installs `manifold3d` 3.5.2
 only as a parity and benchmark reference. Runtime calls made through
 `mojomanifold3d` do not call it.
 
+The compute-heavy signed-distance kernel runs in Mojo, is vectorised, and fans
+its grid out over up to 4 workers above a measured size threshold. Below that
+threshold it is serial, because the worker start-up costs more than the work.
+The threshold and the measurements behind it are in
+[CPU parallelism behind a measured threshold](#cpu-parallelism-behind-a-measured-threshold).
+
 ## Coverage
 
 Implemented:
@@ -152,19 +158,73 @@ then has exactly two entries per group, differing only in the low bit, which
 one pass over the sorted array checks without building edge keys, counts, or a
 weighted `bincount`.
 
-### Single-threaded CPU kernels
+### CPU parallelism behind a measured threshold
 
-The CPU kernels run on one thread. They previously fanned the grid out over
-`std.algorithm.parallelize`, but that function no longer exists in the
-pinned toolchain: importing it fails with
-`package 'algorithm' does not contain 'parallelize'`, and the toolchain
-ships no replacement — there is no `std.parallelism` or `std.threading`
-module. No replacement was found in the `max` package, so the grid is walked in
-a single loop. This port is therefore CPU-serial by toolchain, not by choice,
-and the boolean cases below pay for it against upstream's thread pool.
+`mm_signed_distance` and the pair form `mm_signed_distance_pair` fan the grid
+out over `max.algorithm.parallelize` above a size threshold and stay serial
+below it. The row loop is the same either way: on the serial path the caller's
+thread runs the same task bodies, so no worker is launched at all.
+
+The toolchain's `parallelize` lives in `max.algorithm`; the older
+`std.algorithm` and `std.threading` forms do not compile on the pinned 1.2.0
+toolchain. The worker closure must be a plain nested `def` with an `{imm}`
+capture convention, which is what `parallelize` accepts as
+`def(Int) -> None`.
+
+**Threshold.** Measured, not guessed. The cost that decides it is the worker
+pool start-up: the first parallel call in a process pays about 4.3-4.9 ms
+before any worker runs, and that cost is independent of the grid. Serial
+therefore wins up to roughly the point where one thread's work is itself on the
+order of several milliseconds. On this host that is 50,000-64,000 points for
+this kernel (table below). With a 16x margin for a busier host and a
+smaller-mesh caller, the threshold is **1,000,000 grid points**. Below it the
+call is serial; every boolean at the shipped default resolution is below it.
+
+**Workers.** Capped at 4. On the raw kernel, 4 workers give 2.6-3.9x over one
+thread from 128,000 points upward. Eight workers measured 1.5-2x faster again
+at 1-4 million points, but the host is shared, the gain per added worker
+flattens, and the cap is 4. The column is recorded here rather than taken.
+
+| points | serial | 2 workers | 4 workers | 4 / 1 |
+|---:|---:|---:|---:|---:|
+| 512 | 0.03 ms | 4.38 ms | 4.24 ms | 0.01x |
+| 8,000 | 0.54 ms | 5.25 ms | 4.56 ms | 0.12x |
+| 32,768 | 1.96 ms | 5.32 ms | 4.89 ms | 0.40x |
+| 64,000 | 3.76 ms | 6.49 ms | 5.37 ms | 0.70x |
+| 110,592 | 6.40 ms | 7.78 ms | 6.23 ms | 1.03x |
+| 262,144 | 14.79 ms | 12.34 ms | 8.42 ms | 1.76x |
+| 884,736 | 49.84 ms | 36.14 ms | 31.09 ms | 1.60x |
+| 2,097,152 | 154.17 ms | 70.49 ms | 40.70 ms | 3.79x |
+| 7,077,888 | 436.06 ms | 238.20 ms | 115.68 ms | 3.77x |
+
+`bench/parallel_crossover.cc` reproduces the table: it calls the exported
+kernel directly from C++, so no interpreter runs between launches. Every cell
+is the best of 3-15 calls. The crossover is where the 4-worker column overtakes
+the serial column, 64,000-110,592 points; two workers only match serial there
+because they pay the same start-up.
+
+The grid is split into a task count that depends only on the grid (`row_tasks`:
+one task per row down to 16, capped at 4096), never on the worker count. Each
+task owns a fixed row range and writes only its own samples, so every worker
+configuration produces a bit-identical grid; `tests/test_parallel.py` checks
+that at 1, 2 and 4 workers on several shapes and end to end on a boolean.
+
+The boolean path uses the pair form so one launch evaluates both meshes rather
+than two, and a solid unioned with itself (or two handles to one mesh) is
+detected and evaluated once.
+
+**What it does for real callers.** Every boolean at the default resolution 40
+sits in the 36,000-91,000 point range, below the threshold, so it takes the
+serial path and its timing is unchanged. The parallel path only engages for
+callers that raise the resolution, and those are the ones where it pays. Same
+build, same host, measured back to back with the field pinned serial and at the
+cap, the raw kernel at 127 samples across (1,998,592 points) goes from 1,970.5
+ms to 516.8 ms at 4 workers, a 3.8x gain at that size. With 8 workers the same
+call measured 255.6 ms, but that is past the cap and is not used.
 
 The signed-distance field is the only kernel with enough arithmetic intensity
-to justify GPU execution. `Manifold.boolean(..., device="gpu")` checks for at
+to justify GPU execution; the same holds for parallelism, and only that kernel
+is threaded. `Manifold.boolean(..., device="gpu")` checks for at
 least 4,000 MiB of free NVIDIA memory before every request, caps total device
 buffers below 2 GB, and uses the CPU with a `RuntimeWarning` if the GPU is
 absent, busy, or fails. Device buffers are released when the call completes.
@@ -190,7 +250,22 @@ Rejected without shipping, because the numbers would not have been honest:
 - replacing the divisions in the marching-tetrahedra outward normal with
   multiplication by a reciprocal: `1/3` is inexact, so it would change a
   triangle's winding decision in the last bit, and the topology guarantee is
-  worth more than the divisions.
+  worth more than the divisions;
+- one sign pass per cell in `mm_march_count` instead of a four-way comparison
+  per tetrahedron: the count pass is 0.3-1.0 ms out of a 24-160 ms boolean, so
+  the rewrite had nothing to win and it was reverted rather than kept. The
+  emit, weld and edge-check passes were not touched for the same reason: the
+  measured bottleneck is the signed-distance field at every resolution.
+
+The raw kernel below the threshold is the only parallel path that loses, and it
+is the reason for the threshold rather than a path that ships. For the other
+kernels, the question is whether anything would win: `mm_transform` (0.013 ms
+at 1,026 vertices) and `mm_pairwise_sum` (0.011 ms at 66 x 8) are far below the
+4.3 ms pool start-up, `mm_combine_fields` is 0.23 ms at 250,000 samples,
+`mm_march_count` is 0.3-1.0 ms, and `mm_march_emit` is 12.7 ms on the largest
+benchmark boolean. Only the last is within an order of magnitude of
+break-even, and it was not threaded: no measured caller would gain, so there
+was nothing to verify.
 
 ## Benchmarks
 
@@ -200,7 +275,11 @@ the benchmark's repeat count. The "before" column is the same table measured on
 the same idle host from the pre-optimisation tree, rebuilt from source and run
 back to back with the "now" column. This is a shared machine and repeated runs
 move by up to 20% in both directions, so the table is one run rather than a
-best-of, and the ratios below are from those two runs.
+best-of, and the ratios below are from those two runs. The table was measured
+before the parallel path landed. The boolean rows sit below the parallelism
+threshold, so the path they take did not change; the parallel path's own
+numbers, measured separately on the same host, are in
+[CPU parallelism behind a measured threshold](#cpu-parallelism-behind-a-measured-threshold).
 
 | case | before | mojo-manifold3d | manifold3d 3.5.2 | relative |
 |---|---:|---:|---:|---:|
@@ -213,8 +292,11 @@ best-of, and the ratios below are from those two runs.
 
 - The two boolean rows are 2.0x and 2.1x faster than this port's own previous
   build. They stay far behind upstream because upstream is a parallel C++
-  exact-mesh engine and this port evaluates a dense signed-distance grid on one
-  thread to get a simple, explicit manifold guarantee.
+  exact-mesh engine and this port evaluates a dense signed-distance grid below
+  the parallelism threshold to get a simple, explicit manifold guarantee. The
+  threading of that grid does not move these rows, and the reason is measured
+  above: they pass about 36,000 points, and the 4-worker path only overtakes
+  serial near 50,000-64,000.
 - The convex hull row is Qhull. `scipy.spatial.ConvexHull` accounts for
   essentially all of it, nothing in this repository runs on that path, and the
   two columns differ only by run-to-run noise: replacing Qhull with a Mojo
@@ -240,7 +322,9 @@ on the CPU before now takes 236.9 ms.
 | sphere-box difference (resolution 40) | 508.768 ms | 236.943 ms | 128.463 ms | 1.844x |
 
 Run `pixi run bench` to reproduce the table under the repository's
-machine-wide benchmark lock.
+machine-wide benchmark lock. `pixi run python bench/parallel.py` compares the
+field pinned serial against pinned at the worker cap on the same booleans, and
+`bench/parallel_crossover.cc` reproduces the crossover table.
 
 ## License
 

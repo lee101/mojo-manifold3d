@@ -18,7 +18,15 @@ I = ctypes.c_int64
 F = ctypes.c_double
 
 _SIGNATURES = {
-    "mm_signed_distance": ([I, I, I, F, F, F, F, I, I, I, I], None),
+    "mm_signed_distance": ([I, I, I, F, F, F, F, I, I, I, I, I], None),
+    "mm_signed_distance_pair": (
+        [I, I, I] + [I, I, I] + [F, F, F, F] + [I, I, I, I, I],
+        None,
+    ),
+    "mm_signed_distance_data": (
+        [I, I, I, F, F, F, F, I, I, I, I, I],
+        I,
+    ),
     "mm_signed_distance_gpu": ([I, I, I, I, F, F, F, F, I, I, I, I], I),
     "mm_signed_distance_pair_gpu": (
         [I, I, I, I, I, I, I, I, F, F, F, F, I, I, I, I, I],
