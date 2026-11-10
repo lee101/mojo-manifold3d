@@ -7,6 +7,7 @@ import os
 import platform
 import sys
 import time
+import warnings
 
 import numpy as np
 
@@ -144,17 +145,30 @@ def main():
         cpu = lambda: boolean_at_resolution("cpu")
         gpu = lambda: boolean_at_resolution("gpu")
         cpu()
-        gpu()
-        cpu_time = timeit(cpu, 3)
-        gpu_time = timeit(gpu, 3)
-        print()
-        print("| GPU case | CPU | GPU | acceleration |")
-        print("|---|---:|---:|---:|")
-        print(
-            "| sphere-box difference (resolution 40) | "
-            f"{cpu_time * 1e3:.3f} ms | {gpu_time * 1e3:.3f} ms | "
-            f"{cpu_time / gpu_time:.3f}x |"
-        )
+        # Only report a GPU row when the device path really ran. Below the
+        # measured crossover the request falls back to the CPU, and two CPU
+        # columns under a "GPU" heading would be a made-up number.
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            gpu()
+        ran_on_gpu = not any("Using the CPU implementation" in str(w.message) for w in caught)
+        if ran_on_gpu:
+            cpu_time = timeit(cpu, 3)
+            gpu_time = timeit(gpu, 3)
+            print()
+            print("| GPU case | CPU | GPU | acceleration |")
+            print("|---|---:|---:|---:|")
+            print(
+                "| sphere-box difference (resolution 40) | "
+                f"{cpu_time * 1e3:.3f} ms | {gpu_time * 1e3:.3f} ms | "
+                f"{cpu_time / gpu_time:.3f}x |"
+            )
+        else:
+            print()
+            print(
+                "GPU row omitted: the device path fell back to the CPU at this "
+                "size (see GPU_MIN_POINTS)."
+            )
 
 
 if __name__ == "__main__":

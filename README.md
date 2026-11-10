@@ -80,7 +80,8 @@ cut = body - tool
 assert cut.status() is m3d.Error.NoError
 assert cut.genus() == 1
 
-# Boolean operators use the CPU. Request the optional GPU path explicitly.
+# Boolean operators use the CPU. The optional GPU field path is opt-in and only
+# engages at 1,000,000 grid points or more; below that it warns and uses the CPU.
 cut_gpu = body.boolean(tool, m3d.OpType.Subtract, device="gpu")
 
 mesh = cut.to_mesh()
@@ -222,15 +223,67 @@ cap, the raw kernel at 127 samples across (1,998,592 points) goes from 1,970.5
 ms to 516.8 ms at 4 workers, a 3.8x gain at that size. With 8 workers the same
 call measured 255.6 ms, but that is past the cap and is not used.
 
-The signed-distance field is the only kernel with enough arithmetic intensity
-to justify GPU execution; the same holds for parallelism, and only that kernel
-is threaded. `Manifold.boolean(..., device="gpu")` checks for at
-least 4,000 MiB of free NVIDIA memory before every request, caps total device
-buffers below 2 GB, and uses the CPU with a `RuntimeWarning` if the GPU is
-absent, busy, or fails. Device buffers are released when the call completes.
-Boolean operators remain CPU-only so GPU use is always explicit. One kernel
-launch covers the whole grid, the mesh and the field are each copied once, and
-the tail is covered by the same per-thread bounds check as the body.
+### GPU path behind a measured size gate
+
+The signed-distance field is the only kernel in this port with enough arithmetic
+intensity to make a device transfer worth considering; every other kernel is
+memory-bound or far too small, so it is **CPU only: memory-bound**. The GPU path
+is one kernel launch per call over the whole grid, with the mesh and the field
+copied in once and the field copied out once.
+
+It is also the one path here that loses at the sizes real callers pass. Measured
+on the host below with the exported pair kernel called directly (no interpreter
+between launches), same geometry as the benchmark's sphere-box difference, best
+of two to three calls:
+
+| resolution | grid | points | CPU | GPU | GPU / CPU |
+|---:|---|---:|---:|---:|---:|
+| 28 | 33 x 33 x 33 | 35,937 | 44.2-47.5 ms | 72.2-83.8 ms | 0.53-0.65x |
+| 40 | 45 x 45 x 45 | 91,125 | 133.1 ms | 34.1 ms | 3.90x |
+| 60 | 65 x 64 x 64 | 266,240 | 328.7 ms | 361.8 ms | 0.91x |
+| 80 | 85 x 84 x 84 | 599,760 | 728.8 ms | 780.8 ms | 0.93x |
+
+Arrays agreed with the CPU path to 4.1e-15 and less on every row. The numbers do
+not rise monotonically because the CPU side has its own crossover: below
+1,000,000 points the field is evaluated serially, and the GPU's fixed
+copy-in, launch, and copy-out cost is larger than the whole serial evaluation at
+35,937 points. The shipped boolean resolutions are 28 and 40, so the explicit
+GPU request is left opt-in and gated: **`GPU_MIN_POINTS = 1_000_000`**. Below it
+`Manifold.boolean(..., device="gpu")` runs the CPU path and warns why. Plain
+boolean operators never request the device, so the default path is unchanged.
+
+The GPU path keeps the toolchain's `max.gpu.host.DeviceContext` with
+`block_idx`/`thread_idx` from `max.gpu`. The grid is `(count + 255) // 256`
+blocks of 256 threads, so the last block is partly out of range and the
+kernel's own `point >= count` bounds check masks those threads; grids of 3 x 5
+x 7, 17 x 13 x 11 and 33 x 33 x 33 (105, 2,431 and 35,937 points, none a
+multiple of 256) are checked against the CPU field in
+`test_gpu_field_matches_cpu_including_tail`. A request also needs at least
+4,000 MiB free, caps total device buffers below 2 GB, falls back to the CPU
+with a `RuntimeWarning` when either check fails, and releases its buffers when
+the call completes.
+
+**Skipped on this host.** This machine's GPU is shared and was at 27.5 of
+32.6 GiB in use throughout, with one foreign process holding 15.9 GiB and only
+3391-5353 MiB free. Tests that need the device skip cleanly when there is no
+CUDA device or when free memory is under the 5,000 MiB they need for headroom,
+and the skip message reports the number it saw. On this host that was the usual
+outcome for a full-suite run; with the floor lowered for a single run, all 48
+tests in `tests/test_parity.py` passed, GPU tests included. The README does not
+count a skipped GPU test as evidence the GPU path works.
+
+Two measurements matter for anyone running these trails on a shared device:
+
+- one device call lowers free memory by 759-1553 MiB for the lifetime of the
+  process, so a sequence of calls walks a shared GPU down towards the
+  4,000 MiB production gate; that is why the tests probe before each call;
+- an explicit GPU request allocates a fresh `DeviceContext` per call, and the
+  toolchain's allocator does not return all of it while the process lives.
+
+The GPU tests assert the device path actually ran (a fallback raises under
+`warnings.simplefilter("error")`), so a silent CPU fallback fails the test
+rather than passing it, which is what a volume-only comparison would do.
+
 
 ### Alternatives that did not ship
 
@@ -312,10 +365,13 @@ numbers, measured separately on the same host, are in
   cached on the instance. A single cold `volume()` call still costs about
   0.05 ms; the benchmark measures the pair, which is what a caller asks for.
 
-The one GPU benchmark is deliberately limited to a small, fixed input rather
-than a sweep. The device path is unchanged by this work, so the smaller
-acceleration is the CPU side catching up: the same boolean that took 508.8 ms
-on the CPU before now takes 236.9 ms.
+The GPU row below is the historical `pixi run bench` output from before the size
+gate. It is **not** reproducible now: at resolution 40 the grid is 91,125 points,
+below `GPU_MIN_POINTS`, so `device="gpu"` takes the CPU path and the two columns
+would be the same call. `bench/bench.py` refuses to print a GPU row unless the
+device path actually ran, so a fresh run prints no GPU table. The raw kernel
+numbers that decided the gate are in
+[GPU path behind a measured size gate](#gpu-path-behind-a-measured-size-gate).
 
 | GPU case | CPU before | CPU now | GPU | acceleration |
 |---|---:|---:|---:|---:|

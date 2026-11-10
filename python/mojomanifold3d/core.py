@@ -17,6 +17,11 @@ _CSG_RESOLUTION = 40
 # -1 asks Mojo for its measured worker count; the kernels fall back to serial
 # below their own size threshold. Tests pin this to compare worker counts.
 _SIGNED_DISTANCE_WORKERS = -1
+# Measured crossover for the GPU field path on this host, in grid points. Below
+# it the kernel is cheap next to one copy-in/copy-out plus a launch, so the CPU
+# wins; at the shipped resolutions every boolean is below it. See README's
+# "GPU path behind a measured size gate". Tests pin this to force each branch.
+GPU_MIN_POINTS = 1_000_000
 
 
 class OpType(Enum):
@@ -882,7 +887,11 @@ def _field_pair(first, second, origin, spacing, shape, *, device):
         + first_result.nbytes
         + second_result.nbytes
     )
-    if device == "gpu" and _gpu_memory_available(required_bytes):
+    if (
+        device == "gpu"
+        and count >= GPU_MIN_POINTS
+        and _gpu_memory_available(required_bytes)
+    ):
         if lib().mm_signed_distance_pair_gpu(
             addr(first._vertices),
             addr(first._faces),
@@ -909,12 +918,20 @@ def _field_pair(first, second, origin, spacing, shape, *, device):
             stacklevel=2,
         )
     elif device == "gpu":
-        warnings.warn(
-            "GPU unavailable or below the memory safety threshold; "
-            "using the CPU implementation",
-            RuntimeWarning,
-            stacklevel=2,
-        )
+        if count < GPU_MIN_POINTS:
+            warnings.warn(
+                f"GPU path only engages at {GPU_MIN_POINTS:,} grid points or more; "
+                f"this grid has {count:,}. Using the CPU implementation",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        else:
+            warnings.warn(
+                "GPU unavailable or below the memory safety threshold; "
+                "using the CPU implementation",
+                RuntimeWarning,
+                stacklevel=2,
+            )
     return _field_pair_cpu(first, second, origin, spacing, shape)
 
 

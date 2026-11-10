@@ -1,3 +1,6 @@
+import subprocess
+import warnings
+
 import numpy as np
 import pytest
 
@@ -358,21 +361,111 @@ def test_measurement_matches_numpy_for_non_multiple_triangle_count():
     assert result == pytest.approx((expected_volume, expected_area))
 
 
-def test_explicit_gpu_boolean_matches_cpu_or_falls_back():
+# One device call costs roughly 0.8-1.5 GiB of free memory for the lifetime of
+# the process on this toolchain (measured), on top of the 4,000 MiB the
+# production gate requires up front. Calls succeed here from about 4,600 MiB
+# free, so tests skip under this and otherwise report honestly; a shared GPU at
+# the production gate would otherwise flip between runners pass to pass.
+_GPU_TEST_FLOOR_MIB = 5000
+
+
+def _gpu_free_mib():
+    """Free device memory in MiB, or None when there is no usable device."""
+    try:
+        free = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.free",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+        if free.returncode != 0 or not free.stdout.strip():
+            return None
+        return min(int(line) for line in free.stdout.split())
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def _gpu_active():
+    """True when the explicit GPU path can really be exercised here."""
+    free = _gpu_free_mib()
+    return free is not None and free >= _GPU_TEST_FLOOR_MIB
+
+
+def _gpu_skip_reason():
+    free = _gpu_free_mib()
+    if free is None:
+        return "no CUDA device; GPU tests skipped"
+    return (
+        f"shared GPU has {free} MiB free, under the {_GPU_TEST_FLOOR_MIB} MiB "
+        "these tests need for headroom; GPU tests skipped"
+    )
+
+
+def test_explicit_gpu_boolean_matches_cpu_or_falls_back(monkeypatch):
+    # Below the measured crossover the explicit GPU request must fall back.
+    if not _gpu_active():
+        pytest.skip(_gpu_skip_reason())
     first, second = overlapping_boxes(mm)
+    monkeypatch.setattr(core, "GPU_MIN_POINTS", 0)
     cpu = first.boolean(second, mm.OpType.Add)
-    requested_gpu = first.boolean(second, mm.OpType.Add, device="gpu")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        requested_gpu = first.boolean(second, mm.OpType.Add, device="gpu")
     assert_oriented_manifold(requested_gpu)
     assert requested_gpu.volume() == pytest.approx(cpu.volume(), rel=1e-12)
 
 
 def test_gpu_memory_gate_falls_back_to_cpu(monkeypatch):
     first, second = overlapping_boxes(mm)
+    monkeypatch.setattr(core, "GPU_MIN_POINTS", 0)
     monkeypatch.setattr(core, "_gpu_memory_available", lambda required_bytes: False)
     expected = first.boolean(second, mm.OpType.Add)
-    with pytest.warns(RuntimeWarning, match="using the CPU"):
+    with pytest.warns(RuntimeWarning, match="[Uu]sing the CPU implementation"):
         fallback = first.boolean(second, mm.OpType.Add, device="gpu")
     assert fallback.volume() == pytest.approx(expected.volume(), rel=1e-12)
+
+
+def test_gpu_size_gate_falls_back_below_crossover(monkeypatch):
+    # A real boolean at the default resolution is far below the crossover, so
+    # the GPU request yields bit-identical CPU results and says why.
+    first, second = overlapping_boxes(mm)
+    monkeypatch.setattr(core, "_gpu_memory_available", lambda required_bytes: True)
+    expected = first.boolean(second, mm.OpType.Add)
+    with pytest.warns(RuntimeWarning, match="only engages at"):
+        fallback = first.boolean(second, mm.OpType.Add, device="gpu")
+    assert fallback.volume() == pytest.approx(expected.volume(), rel=1e-12)
+
+
+def test_gpu_field_matches_cpu_including_tail(monkeypatch):
+    # Grids whose point count is not a multiple of the 256-thread block, so the
+    # last block is partly out of range and must be masked by the kernel's
+    # own bounds check.
+    first, second = overlapping_boxes(mm)
+    monkeypatch.setattr(core, "GPU_MIN_POINTS", 0)
+    checked = 0
+    for shape in ((3, 5, 7), (17, 13, 11), (33, 33, 33)):
+        # Probe per call: this process's own earlier device calls lower free
+        # memory, so a grid that would fall back is skipped rather than failed.
+        if not _gpu_active():
+            continue
+        origin = np.array(first._vertices.min(axis=0)) - 0.1
+        spacing = 0.05
+        expected = core._field_pair_cpu(first, second, origin, spacing, shape)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            actual = core._field_pair(
+                first, second, origin, spacing, shape, device="gpu"
+            )
+        for want, got in zip(expected, actual):
+            assert np.allclose(got, want, rtol=0, atol=1e-12)
+        checked += 1
+    if checked == 0:
+        pytest.skip(_gpu_skip_reason())
 
 
 def test_gpu_allocation_cap_is_enforced():
